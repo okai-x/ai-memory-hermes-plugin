@@ -1,9 +1,8 @@
-"""Regression tests for the ai-memory 1.28.1 compatibility fixes.
+"""Regression tests for ai-memory lifecycle and scope compatibility.
 
 Each test here pins one behaviour that was broken against a real
-ai-memory 1.28.1 server: a wrong endpoint, a payload shape the server
-accepted and then dropped, or scoping derived from kwargs Hermes never
-sends.
+The suite covers the current user API, payload shapes the server accepts,
+and scoping derived from kwargs Hermes actually sends.
 """
 
 from __future__ import annotations
@@ -27,6 +26,7 @@ def cfg() -> AiMemoryConfig:
         server_url="http://localhost:49374",
         workspace="hermes",
         project="hermes-test",
+        lifecycle_capture=True,
     )
 
 
@@ -74,15 +74,15 @@ def _capture(client: AiMemoryClient, response: httpx.Response) -> list[httpx.Req
 
 
 # --------------------------------------------------------------- 1. endpoint
-def test_search_uses_admin_search_not_api_v1(cfg: AiMemoryConfig) -> None:
-    """POST /api/v1/search 404s on 1.28.1; the route is GET /admin/search."""
+def test_search_uses_user_api_not_root_admin(cfg: AiMemoryConfig) -> None:
+    """Team members search through the user API, never root-only admin routes."""
     client = AiMemoryClient(cfg)
     seen = _capture(client, httpx.Response(200, json=[]))
     client.search("anything")
     assert len(seen) == 1
     assert seen[0].method == "GET"
-    assert seen[0].url.path == "/admin/search"
-    assert "/api/v1/search" not in str(seen[0].url)
+    assert seen[0].url.path == "/api/v1/search"
+    assert "/admin/" not in str(seen[0].url)
 
 
 # ----------------------------------------------------------- 2. global search

@@ -63,35 +63,21 @@ hermes ai-memory status
 
 ### Server URL
 
-If ai-memory runs on a different host or port, set:
+If ai-memory runs on a different host or port, save it in the active profile:
 
 ```bash
-export AI_MEMORY_SERVER_URL=http://10.0.0.42:49374
+hermes ai-memory config-set server_url http://10.0.0.42:49374
 ```
 
 Or use the `hermes memory setup` wizard.
 
 ### Authentication
 
-Optional Bearer auth via environment variables (secrets are **never written to disk**):
+Bearer auth is profile-scoped. Put the member's key in `$HERMES_HOME/.env`
+(secrets are never written to `ai-memory.json`):
 
 ```bash
-export AI_MEMORY_API_KEY=sk-...
-export AI_MEMORY_AUTH_TOKEN=your-token-here
-```
-
-Add to your shell profile for persistence:
-
-```bash
-# ~/.bashrc or ~/.zshrc
-export AI_MEMORY_API_KEY=sk-...
-```
-
-Or via systemd environment:
-
-```ini
-[Service]
-Environment="AI_MEMORY_API_KEY=sk-..."
+AI_MEMORY_API_KEY=aim_member-key
 ```
 
 Verify which source is active:
@@ -106,16 +92,16 @@ hermes ai-memory config
 
 ### Project Isolation
 
-The provider writes to the resolved project. Reads remain global by default for compatibility; choose `search_scope=project` to restrict searches and recall to that project. `initialize()` resolves the scope in this order:
+The provider writes to and reads from the resolved project by default. `initialize()` resolves the scope in this order:
 
 1. Explicit kwargs — `ai_memory_workspace`, `project`
-2. Explicit config — `workspace` / `project` in `$HERMES_HOME/ai-memory.json`, or `AI_MEMORY_WORKSPACE` / `AI_MEMORY_PROJECT`
+2. Explicit config — `workspace` / `project` in `$HERMES_HOME/ai-memory.json`
 3. The nearest `.ai-memory.toml` at or above the session's working directory
 4. What Hermes reports — `agent_workspace`, then `agent_identity` as `hermes-{profile}` (defaults: `hermes` / `hermes-default`)
 
 For legacy-generated `hermes` / `hermes-default` pairs, see the deterministic [compatibility rule and explicit opt-out](../README.md#legacy-scope-defaults-and-explicit-overrides). New installers leave scope unset; leave setup scope prompts blank to use markers.
 
-For a single profile with folder-based memory, set `search_scope` to `project` in `ai-memory.json` (or `AI_MEMORY_SEARCH_SCOPE`) and omit fixed workspace/project overrides. The nearest applicable marker above the absolute, existing session directory wins, including markers within monorepo applications.
+For a single profile with folder-based memory, keep the default `search_scope=project` and omit fixed workspace/project overrides. The nearest applicable marker above the absolute, existing session directory wins, including markers within monorepo applications.
 
 With no project marker and no configured project, writes and handoff consumption are blocked. Explicit default-project configuration is still supported. Project-mode recall with unknown scope returns no results rather than falling back to global search.
 
@@ -132,37 +118,35 @@ When a new conversation starts, the provider resolves the scope (above) and fetc
 The agent calls `prefetch(query, session_id=...)` with the user's message. The provider:
 
 1. Consumes the cached hits `queue_prefetch` stored for that `(session_id, query)`, if any
-2. Otherwise searches the wiki with `GET /admin/search?q=<query>&limit=3`
-3. Returns one block per hit, labelled `title (path): snippet` — recall spans every project, so the block names where each fact came from
+2. Otherwise searches the wiki with the member API at `GET /api/v1/search?q=<query>&limit=3`
+3. Returns one block per hit, labelled `title (path): snippet`
 
-`queue_prefetch(query, session_id=...)` runs the search on a daemon thread right after a turn, which is what makes the next turn's `prefetch` a cache read.
+Hermes runs `queue_prefetch(query, session_id=...)` on its serialized, profile-bound memory worker after a turn, which makes the next turn's `prefetch` a cache read.
 
 ### After Each Turn (`sync_turn`)
 
-After each user+assistant exchange:
+With `lifecycle_capture=true`, after each user+assistant exchange:
 
-1. Spawns a daemon thread
-2. Sends `POST /hook?event=user-prompt-submit` with `{"session_id", "prompt"}` — the field ai-memory reads — plus the session's `cwd`
-3. Swallows errors (logged only)
+1. Hermes schedules the call on its profile-bound memory worker
+2. The provider sends `POST /hook?event=user-prompt-submit` with `{"session_id", "prompt"}` — the field ai-memory reads — plus the session's `cwd`
+3. Errors are logged without breaking the conversation
 
 ### Session End (`on_session_end`)
 
-When the conversation ends:
+With `lifecycle_capture=true`, when the conversation ends:
 
-1. Spawns a daemon thread
-2. Sends `POST /hook?event=session-end` with the session id only — the server reads no body field on this event, and posting the transcript risked the 0.5s turn-hook timeout dropping the close
-3. Swallows errors (logged only)
+1. Hermes serializes the boundary after pending turn writes
+2. The provider sends `POST /hook?event=session-end` with the session id only — the server reads no body field on this event
+3. Errors are logged without breaking session shutdown
 
 If a close is ever lost (server down at that moment), `ai-memory finalize-session --agent hermes` posts the same event afterwards.
 
-### Memory Mirroring (`on_memory_write`)
+### Personal memory (`on_memory_write`)
 
-When Hermes writes to built-in `MEMORY.md` or `USER.md`:
-
-1. Mirrors the write to the ai-memory wiki via `POST /admin/write-page`
-2. Path: `hermes-memory/{target}.md`
-3. Tags: `hermes`, `mirror`
-4. `add` and `replace` are mirrored — a `replace` keeps the superseded entry in the page under `## Substituído`. `remove` is skipped: the wiki keeps the page history rather than a tombstone.
+Hermes keeps built-in `MEMORY.md` and `USER.md` inside each member's profile.
+The provider does not mirror those files to the shared ai-memory project. Team
+knowledge is written explicitly with `ai_memory_write`; completed conversations
+stay local unless `lifecycle_capture` is explicitly enabled.
 
 ## Using Tools
 
@@ -254,11 +238,20 @@ hermes --profile personal
 
 ### Disable Auto-Capture
 
-The plugin has no toggle for auto-capture — it always captures turns. To disable, set the provider to a no-op in Hermes config:
+Lifecycle capture is disabled by default. Keep this in `$HERMES_HOME/ai-memory.json` for curated team memory:
 
-```yaml
-memory:
-  provider: ""
+```json
+{
+  "lifecycle_capture": false
+}
+```
+
+This disables lifecycle persistence, not remote recall. The provider still sends the current query to the configured ai-memory search endpoint. Use `hermes memory off` before a conversation whose query text must remain on the workstation.
+
+Enable it only for a project whose members have agreed to share conversation prompts:
+
+```bash
+hermes ai-memory config-set lifecycle_capture true
 ```
 
 ### Custom Handoff Agent

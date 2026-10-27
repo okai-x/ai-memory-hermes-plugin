@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import os
 import shutil
 import sys
@@ -17,7 +18,13 @@ if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
 from client import AiMemoryClient  # noqa: E402
-from config import _secret_keys, load_config, save_config  # noqa: E402
+from config import (  # noqa: E402
+    _secret_keys,
+    explicit_scope_keys,
+    load_config,
+    marker_scope,
+    save_config,
+)
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 REPO_TARBALL_URL = (
@@ -64,11 +71,15 @@ def register_cli(subparsers: argparse._SubParsersAction) -> None:
 
 
 def cmd_status(args: argparse.Namespace) -> None:
-    config = load_config(_hermes_home(args))
+    hermes_home = _hermes_home(args)
+    config = load_config(hermes_home)
     client = AiMemoryClient(config)
     try:
-        result = client.status()
-        # /admin/status nests the lifetime counters under `counts`.
+        explicit = explicit_scope_keys(hermes_home)
+        marker = marker_scope(os.getcwd())
+        workspace = config.workspace if "workspace" in explicit else marker.get("workspace")
+        project = config.project if "project" in explicit else marker.get("project")
+        result = client.status(workspace=workspace, project=project)
         counts = result.get("counts", {})
         print("ai-memory server: reachable")
         print(f"  Version:      {result.get('version', '?')}")
@@ -77,6 +88,8 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(f"  Observations: {counts.get('observations', '?')}")
     except Exception as e:
         print(f"ai-memory server: unreachable ({e})")
+    finally:
+        client.close()
 
 
 def cmd_config(args: argparse.Namespace) -> None:
@@ -89,13 +102,14 @@ def cmd_config(args: argparse.Namespace) -> None:
         if os.environ.get(env_var):
             status = f"(set via env: {env_var})"
         elif value:
-            status = "(set — migrate to env var)"
+            status = "(set in active profile)"
         else:
             status = "(not set)"
         print(f"  {key}: {status}")
     print(f"  workspace:  {config.workspace}")
     print(f"  project:    {config.project}")
     print(f"  search_scope: {config.search_scope}")
+    print(f"  lifecycle_capture: {config.lifecycle_capture}")
 
 
 def cmd_config_set(args: argparse.Namespace) -> None:
@@ -111,6 +125,11 @@ def cmd_config_set(args: argparse.Namespace) -> None:
         return
 
     hermes_home = _hermes_home(args)
+    if key == "lifecycle_capture":
+        normalized = value.strip().lower()
+        if normalized not in ("true", "false"):
+            raise ValueError("lifecycle_capture must be true or false")
+        value = normalized == "true"
     skipped = save_config({key: value}, hermes_home)
     if skipped:
         for s in skipped:
@@ -235,10 +254,10 @@ def cmd_update(args: argparse.Namespace) -> None:
     else:
         default_config = {
             "server_url": "http://127.0.0.1:49374",
-            "search_scope": "global",
+            "search_scope": "project",
+            "lifecycle_capture": False,
         }
-        config_body = ",\n".join(f'  "{k}": "{v}"' for k, v in default_config.items())
-        config_file.write_text("{\n" + config_body + "\n}\n")
+        config_file.write_text(json.dumps(default_config, indent=2) + "\n")
         print(f"  Config:      {config_file} (created)")
 
     # Cleanup temp download

@@ -11,6 +11,8 @@ from cli import cmd_config, cmd_config_set
 from config import AiMemoryConfig, explicit_scope_keys, get_config_schema, load_config, save_config
 from provider import AiMemoryProvider
 
+from tests.conftest import mcp_response
+
 
 @pytest.mark.parametrize("scope_origin", [None, "automatic", "explicit"])
 @pytest.mark.parametrize("directory,workspace,project", [
@@ -50,8 +52,12 @@ def test_legacy_defaults_route_to_nearest_marker(
             requests.append(request)
             if request.url.path == "/handoff":
                 return httpx.Response(404)
-            body = [] if request.url.path == "/admin/search" else {"ok": True}
-            return httpx.Response(200, json=body)
+            if request.url.path == "/api/v1/search":
+                return httpx.Response(200, json=[])
+            if request.url.path == "/mcp":
+                arguments = json.loads(request.content)["params"]["arguments"]
+                return mcp_response({"page_id": "page-1", "path": arguments["path"]})
+            return httpx.Response(200, json={"ok": True})
 
         client._transport = httpx.MockTransport(handler)
         return client
@@ -63,7 +69,8 @@ def test_legacy_defaults_route_to_nearest_marker(
     assert requests[-1].url.params["project"] == project
     assert requests[-1].url.params["workspace"] == workspace
     assert provider._write({"path": "note.md", "body": "private"})["ok"]
-    assert json.loads(requests[-1].content)["project"] == project
+    payload = json.loads(requests[-1].content)["params"]["arguments"]
+    assert payload["project"] == project
     assert config_file.read_bytes() == before
 
 
@@ -89,7 +96,7 @@ def test_setup_schema_does_not_generate_fixed_scope(tmp_path: Path) -> None:
     values = {field["key"]: field["default"] for field in get_config_schema() if "default" in field}
     save_config(values, str(tmp_path))
     assert explicit_scope_keys(str(tmp_path)) == set()
-    assert load_config(str(tmp_path)).search_scope == "global"
+    assert load_config(str(tmp_path)).search_scope == "project"
 
 
 @pytest.mark.parametrize("values,expected", [
@@ -112,17 +119,17 @@ def test_legacy_classification_is_narrow(
     assert explicit_scope_keys(str(tmp_path)) == expected
 
 
-def test_environment_defaults_are_always_explicit(
+def test_environment_behavior_is_ignored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (tmp_path / "ai-memory.json").write_text(json.dumps({
-        "workspace": "hermes", "project": "hermes-default",
+        "workspace": "hermes", "project": "hermes-default", "search_scope": "project",
     }))
     monkeypatch.setenv("AI_MEMORY_SEARCH_SCOPE", "project")
     assert explicit_scope_keys(str(tmp_path)) == set()
     monkeypatch.setenv("AI_MEMORY_WORKSPACE", "hermes")
     monkeypatch.setenv("AI_MEMORY_PROJECT", "hermes-default")
-    assert explicit_scope_keys(str(tmp_path)) == {"workspace", "project"}
+    assert explicit_scope_keys(str(tmp_path)) == set()
 
 
 @pytest.mark.parametrize("key", ["search_scope", "scope_origin"])
@@ -147,6 +154,6 @@ def test_installer_templates_do_not_pin_scope(script: str) -> None:
         match = re.search(r'\$(?:Config|defaultConfig) = @{(.*?)\n        }', text, re.DOTALL)
         assert match
         values = dict(re.findall(r'(\w+)\s*=\s*"([^"]*)"', match.group(1)))
-    assert values["search_scope"] == "global"
+    assert values["search_scope"] == "project"
     assert "workspace" not in values
     assert "project" not in values

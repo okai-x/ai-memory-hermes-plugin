@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -23,6 +25,8 @@ def test_config_defaults() -> None:
     assert cfg.auth_token == ""
     assert cfg.workspace == "hermes"
     assert cfg.project == "hermes-default"
+    assert cfg.search_scope == "project"
+    assert cfg.lifecycle_capture is False
 
 
 def test_config_custom_values() -> None:
@@ -46,6 +50,22 @@ def test_get_config_schema() -> None:
     assert "auth_token" in keys
     assert "workspace" in keys
     assert "project" in keys
+    assert "lifecycle_capture" in keys
+
+
+def test_lifecycle_capture_opt_in_roundtrip(tmp_path: Path) -> None:
+    save_config({"lifecycle_capture": True}, str(tmp_path))
+    assert load_config(str(tmp_path)).lifecycle_capture is True
+
+
+@pytest.mark.parametrize(("value", "expected"), [("true", True), ("false", False)])
+def test_lifecycle_capture_setup_string_roundtrip(
+    tmp_path: Path, value: str, expected: bool,
+) -> None:
+    save_config({"lifecycle_capture": value}, str(tmp_path))
+    data = json.loads((tmp_path / "ai-memory.json").read_text())
+    assert data["lifecycle_capture"] is expected
+    assert load_config(str(tmp_path)).lifecycle_capture is expected
 
 
 def test_save_config_creates_file(tmp_path: Path) -> None:
@@ -82,7 +102,7 @@ def test_load_config_from_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     )
     cfg = load_config(str(tmp_path))
     assert cfg.server_url == "http://file:49374"
-    assert cfg.auth_token == "file-token"
+    assert cfg.auth_token == ""
     assert cfg.workspace == "file-ws"
     assert cfg.project == "file-proj"
 
@@ -101,11 +121,13 @@ def test_save_config_creates_parent_dirs(tmp_path: Path) -> None:
     assert (deep / "ai-memory.json").exists()
 
 
-def test_load_config_falls_back_to_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_config_reads_only_secrets_from_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("AI_MEMORY_SERVER_URL", "http://env:49374")
     monkeypatch.setenv("AI_MEMORY_AUTH_TOKEN", "env-token")
     cfg = load_config(str(tmp_path))
-    assert cfg.server_url == "http://env:49374"
+    assert cfg.server_url == "http://127.0.0.1:49374"
     assert cfg.auth_token == "env-token"
 
 
@@ -138,7 +160,9 @@ def test_load_config_corrupt_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert cfg.auth_token == ""
 
 
-def test_load_config_env_overrides_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_secret_env_does_not_override_file_behavior(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     p = tmp_path / "ai-memory.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(
@@ -152,7 +176,7 @@ def test_load_config_env_overrides_file(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setenv("AI_MEMORY_SERVER_URL", "http://env:49374")
     monkeypatch.setenv("AI_MEMORY_AUTH_TOKEN", "env-token")
     cfg = load_config(str(tmp_path))
-    assert cfg.server_url == "http://env:49374"
+    assert cfg.server_url == "http://file:49374"
     assert cfg.auth_token == "env-token"
 
 
@@ -231,12 +255,14 @@ def test_get_config_schema_has_env_only() -> None:
             assert "env_var" in item
 
 
-def test_load_config_reads_scope_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_config_ignores_behavior_from_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("AI_MEMORY_WORKSPACE", "env-ws")
     monkeypatch.setenv("AI_MEMORY_PROJECT", "env-proj")
     cfg = load_config(str(tmp_path))
-    assert cfg.workspace == "env-ws"
-    assert cfg.project == "env-proj"
+    assert cfg.workspace == "hermes"
+    assert cfg.project == "hermes-default"
 
 
 def test_explicit_scope_keys_reports_only_operator_values(
@@ -250,7 +276,30 @@ def test_explicit_scope_keys_reports_only_operator_values(
     assert explicit_scope_keys(str(tmp_path)) == {"project"}
 
     monkeypatch.setenv("AI_MEMORY_WORKSPACE", "env-ws")
-    assert explicit_scope_keys(str(tmp_path)) == {"workspace", "project"}
+    assert explicit_scope_keys(str(tmp_path)) == {"project"}
+
+
+def test_load_config_reads_secret_from_hermes_profile_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_module = types.ModuleType("agent")
+    setattr(agent_module, "__path__", [])
+    secret_module = types.ModuleType("agent.secret_scope")
+    setattr(
+        secret_module,
+        "get_secret_str",
+        lambda name: {
+            "AI_MEMORY_AUTH_TOKEN": "profile-token",
+            "AI_MEMORY_API_KEY": "",
+        }.get(name, ""),
+    )
+    monkeypatch.setitem(sys.modules, "agent", agent_module)
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", secret_module)
+    monkeypatch.setenv("AI_MEMORY_AUTH_TOKEN", "launch-profile-token")
+
+    cfg = load_config(str(tmp_path))
+
+    assert cfg.auth_token == "profile-token"
 
 
 def test_marker_scope_reads_the_nearest_scope_marker(tmp_path: Path) -> None:

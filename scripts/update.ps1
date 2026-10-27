@@ -139,7 +139,7 @@ function Invoke-Preflight {
     # 8. ai-memory server
     Write-Info "Checking ai-memory server at $env:AI_MEMORY_SERVER_URL ..."
     try {
-        $response = Invoke-WebRequest -Uri "$env:AI_MEMORY_SERVER_URL/admin/status" -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
+        $response = Invoke-WebRequest -Uri "$env:AI_MEMORY_SERVER_URL/healthz" -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
         Write-Ok "ai-memory server is reachable"
     }
     catch {
@@ -302,7 +302,8 @@ if (-not $Script:DoDryRun) {
     else {
         $defaultConfig = @{
             server_url = "http://127.0.0.1:49374"
-            search_scope = "global"
+            search_scope = "project"
+            lifecycle_capture = $false
         }
         $defaultConfig | ConvertTo-Json | Set-Content -Path $ConfigFile -Encoding UTF8
         Write-Info "Config:      $ConfigFile (created)"

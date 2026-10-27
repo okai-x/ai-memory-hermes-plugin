@@ -13,9 +13,11 @@ Dataclass in `config.py`. Fields:
 | `auth_token` | `str` | `""` | Auth token alias |
 | `workspace` | `str` | `"hermes"` | ai-memory workspace name |
 | `project` | `str` | `"hermes-default"` | ai-memory project name |
-| `search_scope` | `str` | `"global"` | `global` (legacy recall) or `project` (isolated recall); other values are rejected |
+| `search_scope` | `str` | `"project"` | `project` (isolated recall) or explicit `global`; other values are rejected |
+| `lifecycle_capture` | `bool` | `false` | Persist prompts and session-end events as shared project lifecycle records when explicitly enabled |
 
-Precedence: **env vars > file config > defaults**
+Behavior precedence: **file config > defaults**. Credentials come from Hermes'
+active profile secret scope (`AI_MEMORY_AUTH_TOKEN` / `AI_MEMORY_API_KEY`).
 
 ### Config File Location
 
@@ -26,13 +28,13 @@ Precedence: **env vars > file config > defaults**
 `initialize()` resolves `workspace` / `project` in this order:
 
 1. Explicit kwargs — `ai_memory_workspace`, `project`
-2. Explicit config — `workspace` / `project` in `ai-memory.json`, or `AI_MEMORY_WORKSPACE` / `AI_MEMORY_PROJECT`
+2. Explicit config — `workspace` / `project` in `ai-memory.json`
 3. The nearest `.ai-memory.toml` at or above the session's `cwd`, read with ai-memory's own line-based parser (a marker that pins no scope key is skipped)
 4. What Hermes reports — `agent_workspace`, then `agent_identity` as `hermes-<identity>` — and finally the defaults (`hermes` / `hermes-default`)
 
 Only an absolute, existing directory is eligible for marker lookup. Missing, relative and file paths are not anchored to process cwd and do not inherit a parent marker. A missing marker or an incomplete scope cannot authorize writes through implicit profile/default project labels. Explicit project configuration (including `hermes-default`) remains supported; custom programmatic project values remain a configured fallback. Each initialization starts from configuration, never from the previously resolved marker scope.
 
-`search_scope=global` preserves legacy global search; `search_scope=project` applies the resolved scope to every provider search/prefetch. An unknown scope in project mode returns an error/empty recall, never global results. Writes, lifecycle capture, mirrors and handoff consumption require a known workspace/project and a primary context in either search mode.
+`search_scope=project` is the default and applies the resolved scope to every provider search/prefetch. `search_scope=global` is an explicit opt-in. An unknown scope in project mode returns an error/empty recall, never global results. Shared writes, lifecycle capture and handoff consumption require a known workspace/project and a primary context.
 
 **No dynamic directory-scope switching:** the memory-provider contract supplies the construction cwd at `initialize()`, not the updated live agent cwd. A new initialized provider with the target directory is required; `on_session_switch()` updates the session ID and invalidates recall, but does not re-resolve cwd. See the [Hermes contract](https://hermes-agent.nousresearch.com/docs/developer-guide/memory-provider-plugin).
 
@@ -47,7 +49,8 @@ Legacy-generated default pairs are exempt from explicit file precedence only in 
 | `auth_token` | yes | yes | `AI_MEMORY_AUTH_TOKEN` | `""` |
 | `workspace` | no | no | — | `""` (directory routing) |
 | `project` | no | no | — | `""` (directory routing) |
-| `search_scope` | no | no | `AI_MEMORY_SEARCH_SCOPE` | `"global"` |
+| `search_scope` | no | no | — | `"project"` |
+| `lifecycle_capture` | no | no | — | `false` |
 
 **Env Only** fields are never written to `ai-memory.json`. They must be set via environment variables.
 
@@ -59,26 +62,26 @@ Typed HTTP wrapper in `client.py`. Accepts `AiMemoryConfig`. Persistent `httpx.C
 
 #### `search(query, workspace=None, project=None, limit=3) → list[dict]`
 
-**HTTP:** `GET /admin/search?q=<query>&limit=<n>&workspace=<ws>&project=<proj>`  
-**Timeout:** 10s  
+**HTTP:** `GET /api/v1/search?q=<query>&limit=<n>&workspace=<ws>&project=<proj>`
+**Timeout:** 10s
 **Raises:** `httpx.HTTPStatusError` on non-2xx
 
 Returns list of result dicts with keys like `path`, `snippet`, `score`.
 
 #### `write_page(path, body, tags=None, tier=None, pinned=False, workspace=None, project=None) → dict`
 
-**HTTP:** `POST /admin/write-page`  
-**Timeout:** 10s  
+**HTTP:** stateless `POST /mcp`, tool `memory_write_page`
+**Timeout:** 10s
 **Raises:** `httpx.HTTPStatusError` on non-2xx
 
-Returns `{"ok": true, "path": "..."}` or error dict.
+Returns the MCP tool payload, including `page_id` and `path`.
 
-#### `status() → dict`
+#### `status(workspace=None, project=None) → dict`
 
-**HTTP:** `GET /admin/status`  
+**HTTP:** stateless `POST /mcp`, tool `memory_status`
 **Timeout:** 10s
 
-Returns the server's status report. The lifetime counters are nested under `counts` (`pages_latest`, `pages_all`, `sessions`, `observations`, `evidence_rows`), alongside `version` and `data_dir`.
+Returns the scoped status report. Counters are nested under `counts`.
 
 #### `send_hook(event, session_id, payload=None, workspace=None, project=None, cwd=None, timeout=None) → None`
 
@@ -113,11 +116,11 @@ Implements `MemoryProvider` ABC in `provider.py`.
 - `handle_tool_call(name, args) → str` (returns JSON string)
 - `system_prompt_block() → str`
 - `prefetch(query, *, session_id="") → str` — cached hits from `queue_prefetch`, else a search; each hit is labelled `title (path): snippet`
-- `queue_prefetch(query, *, session_id="")` — daemon thread; captures client/scope and caches by `(session_id, search_scope, workspace, project, query)`; initialization/session switches discard stale results
+- `queue_prefetch(query, *, session_id="")` — runs on Hermes' serialized profile-bound memory worker and caches by `(session_id, search_scope, workspace, project, query)`; initialization/session switches discard stale results
 - `recall_status() → RecallStatus | None` — hit count of the last `prefetch`, `None` when it injected nothing
-- `sync_turn(user, assistant, *, session_id="", **kwargs)` — daemon thread
-- `on_session_end(messages, **kwargs)` — daemon thread; sends the session id, never the transcript
-- `on_memory_write(action, target, content, metadata=None)` — mirrors `add` / `replace`; `remove` is skipped
+- `sync_turn(user, assistant, *, session_id="", **kwargs)` — with `lifecycle_capture=true`, sends the prompt from Hermes' memory worker
+- `on_session_end(messages, **kwargs)` — with `lifecycle_capture=true`, sends the session id, never the transcript
+- `on_memory_write(action, target, content, metadata=None)` — no-op; personal memory stays in the member profile
 - `shutdown()`
 
 ## CLI (`register_cli`)
@@ -157,10 +160,10 @@ python_dependencies:
 
 Entry point in `__init__.py`:
 
-1. Resolves config: file (`$HERMES_HOME/ai-memory.json`) → env var overrides (env wins for secrets)
-2. Creates `AiMemoryConfig` with merged values (secrets env-only, never persisted)
-3. Instantiates `AiMemoryProvider(config=config)`
-4. Calls `ctx.register_memory_provider(provider)`
+1. Creates a fresh, unbound `AiMemoryProvider`
+2. Calls `ctx.register_memory_provider(provider)`
+3. Hermes later calls `initialize()` with the owning profile's `hermes_home`
+4. The provider binds that profile's JSON behavior and secret scope
 
 ## Install Scripts
 
@@ -177,7 +180,7 @@ All scripts run **pre-flight checks** before making changes:
 
 1. Hermes CLI availability (warn if missing)
 2. Hermes process status (warn if running — restart needed)
-3. ai-memory server reachability (try `/admin/status` endpoint)
+3. ai-memory server reachability (try `/healthz`)
 4. Existing plugin state (installed? symlink/copy? empty?)
 5. Write permissions to `$HERMES_HOME/plugins/`
 6. Config file existence and contents

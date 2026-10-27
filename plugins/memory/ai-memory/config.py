@@ -18,16 +18,6 @@ if _PLUGIN_DIR not in sys.path:
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:49374"
 
-# Env vars the plugin honours; each one overrides the JSON file below it.
-_ENV_MAP: dict[str, str] = {
-    "AI_MEMORY_SERVER_URL": "server_url",
-    "AI_MEMORY_AUTH_TOKEN": "auth_token",
-    "AI_MEMORY_API_KEY": "api_key",
-    "AI_MEMORY_WORKSPACE": "workspace",
-    "AI_MEMORY_PROJECT": "project",
-    "AI_MEMORY_SEARCH_SCOPE": "search_scope",
-}
-
 # Scope keys ``.ai-memory.toml`` may pin, in the server's own order.
 _MARKER_SCOPE_KEYS: tuple[str, ...] = ("workspace", "project")
 _MARKER_FILENAME = ".ai-memory.toml"
@@ -40,15 +30,22 @@ class AiMemoryConfig:
     auth_token: str = ""
     workspace: str = "hermes"
     project: str = "hermes-default"
-    search_scope: str = "global"
+    search_scope: str = "project"
+    lifecycle_capture: bool = False
 
     def __post_init__(self) -> None:
         _validate_search_scope(self.search_scope)
+        _validate_lifecycle_capture(self.lifecycle_capture)
 
 
 def _validate_search_scope(value: Any) -> None:
     if value not in ("global", "project"):
         raise ValueError("search_scope must be global or project")
+
+
+def _validate_lifecycle_capture(value: Any) -> None:
+    if not isinstance(value, bool):
+        raise ValueError("lifecycle_capture must be true or false")
 
 
 def _validate_scope_origin(values: dict[str, Any]) -> None:
@@ -82,9 +79,15 @@ def get_config_schema() -> list[dict[str, Any]]:
         },
         {
             "key": "search_scope",
-            "description": "Recall scope: global (legacy default) or project",
-            "default": "global",
+            "description": "Recall scope: project (recommended) or global",
+            "default": "project",
             "choices": ["global", "project"],
+            "required": False,
+        },
+        {
+            "key": "lifecycle_capture",
+            "description": "Send user prompts and session-end events to shared ai-memory",
+            "default": False,
             "required": False,
         },
         {
@@ -115,8 +118,16 @@ def _secret_keys() -> dict[str, str]:
 
 def save_config(values: dict[str, Any], hermes_home: str) -> list[str]:
     """Save non-secret config values to disk. Returns list of skipped secret keys."""
+    values = dict(values)
     if "search_scope" in values:
         _validate_search_scope(values["search_scope"])
+    if "lifecycle_capture" in values:
+        raw_capture = values["lifecycle_capture"]
+        if isinstance(raw_capture, str):
+            normalized = raw_capture.strip().lower()
+            if normalized in ("true", "false"):
+                values["lifecycle_capture"] = normalized == "true"
+        _validate_lifecycle_capture(values["lifecycle_capture"])
     _validate_scope_origin(values)
     secrets = _secret_keys()
     skipped: list[str] = []
@@ -153,8 +164,17 @@ def save_config(values: dict[str, Any], hermes_home: str) -> list[str]:
     return skipped
 
 
+def _profile_secret(name: str) -> str:
+    """Read a secret from Hermes' active profile, with a standalone fallback."""
+    try:
+        from agent.secret_scope import get_secret_str
+    except ImportError:
+        return os.environ.get(name, "")
+    return get_secret_str(name)
+
+
 def _read_overrides(hermes_home: str) -> dict[str, Any]:
-    """JSON-file overrides, then env-var overrides (env wins)."""
+    """Read profile behavior from disk and credentials from its secret scope."""
     overrides: dict[str, Any] = {}
     p = Path(hermes_home) / "ai-memory.json" if hermes_home else None
 
@@ -165,14 +185,13 @@ def _read_overrides(hermes_home: str) -> dict[str, Any]:
             overrides = {}
 
     _validate_scope_origin(overrides)
+    for secret_key in _secret_keys():
+        overrides.pop(secret_key, None)
     # Only the complete legacy-generated shape is ambiguous. Never infer
     # provenance from a project name alone or reinterpret customized files.
-    effective_mode = os.environ.get("AI_MEMORY_SEARCH_SCOPE") or overrides.get(
-        "search_scope", "global"
-    )
     legacy_keys = {"server_url", "workspace", "project", "search_scope", "scope_origin"}
     if (
-        effective_mode == "project"
+        overrides.get("search_scope") == "project"
         and overrides.get("scope_origin") != "explicit"
         and set(overrides) <= legacy_keys
         and overrides.get("workspace") == "hermes"
@@ -181,8 +200,8 @@ def _read_overrides(hermes_home: str) -> dict[str, Any]:
         overrides.pop("workspace")
         overrides.pop("project")
 
-    for env_key, attr in _ENV_MAP.items():
-        val = os.environ.get(env_key)
+    for attr, env_key in _secret_keys().items():
+        val = _profile_secret(env_key)
         if val:
             overrides[attr] = val
 

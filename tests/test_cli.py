@@ -119,6 +119,21 @@ def test_cmd_config_set_allows_non_secrets(
     assert data["workspace"] == "my-ws"
 
 
+@pytest.mark.parametrize("value,expected", [("true", True), ("false", False)])
+def test_cmd_config_set_parses_lifecycle_capture_bool(
+    tmp_path: Path, value: str, expected: bool
+) -> None:
+    from cli import cmd_config_set
+
+    args = argparse.Namespace(
+        hermes_home=str(tmp_path), key="lifecycle_capture", value=value,
+    )
+    cmd_config_set(args)
+
+    data = json.loads((tmp_path / "ai-memory.json").read_text())
+    assert data["lifecycle_capture"] is expected
+
+
 def test_cmd_config_set_rejects_api_key(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
     from cli import cmd_config_set
 
@@ -284,7 +299,8 @@ def test_cmd_update_creates_default_config(
     assert config_file.exists()
     config = json.loads(config_file.read_text())
     assert config["server_url"] == "http://127.0.0.1:49374"
-    assert config["search_scope"] == "global"
+    assert config["search_scope"] == "project"
+    assert config["lifecycle_capture"] is False
     assert "workspace" not in config
     assert "project" not in config
 

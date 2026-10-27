@@ -127,7 +127,7 @@ preflight() {
   fi
   server_url="${server_url:-http://127.0.0.1:49374}"
   info "Checking ai-memory server at $server_url ..."
-  if curl -sf --connect-timeout 3 "$server_url/admin/status" >/dev/null 2>&1; then
+  if curl -sf --connect-timeout 3 "$server_url/healthz" >/dev/null 2>&1; then
     ok "ai-memory server is reachable — will become unavailable after uninstall"
   else
     info "ai-memory server is not reachable (may already be stopped)"

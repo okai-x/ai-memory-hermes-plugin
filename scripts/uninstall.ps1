@@ -119,7 +119,7 @@ function Invoke-Preflight {
     }
     Write-Info "Checking ai-memory server at $serverUrl ..."
     try {
-        $response = Invoke-WebRequest -Uri "$serverUrl/admin/status" -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
+        $response = Invoke-WebRequest -Uri "$serverUrl/healthz" -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
         Write-Ok "ai-memory server is reachable — will become unavailable after uninstall"
     }
     catch {
