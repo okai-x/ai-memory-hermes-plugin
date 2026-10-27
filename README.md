@@ -1,18 +1,17 @@
 # ai-memory Hermes Memory Provider Plugin
 
-Connects [Hermes Agent](https://github.com/NousResearch/hermes-agent) to [ai-memory](https://github.com/akitaonrails/ai-memory) as a first-class `MemoryProvider` plugin — automatic prefetch, turn sync, session finalization, and wiki search/write tools.
+Connects [Hermes Agent](https://github.com/NousResearch/hermes-agent) to [ai-memory](https://github.com/akitaonrails/ai-memory) as a first-class `MemoryProvider` plugin — automatic prefetch, explicit shared writes, optional lifecycle capture, and wiki search tools.
 
 ## Features
 
-- **Background prefetch** — each turn's recall search runs on a daemon thread after the turn and is injected before the next one
-- **Turn capture** — async daemon-thread sync after each completed turn
-- **Session finalization** — `session-end` hook on conversation close (the session id only, never the transcript)
-- **Memory mirroring** — built-in `MEMORY.md` / `USER.md` writes (`add`, `replace`) mirrored to the ai-memory wiki
+- **Background prefetch** — Hermes' profile-bound memory worker searches after each turn and injects the cached result before the next one
+- **Lifecycle storage is opt-in** — turn capture and session finalization are off until `lifecycle_capture` is explicitly enabled
+- **Personal memory stays personal** — built-in `MEMORY.md` / `USER.md` are not copied into the shared wiki
 - **Hermes CLI integration** — `hermes memory setup` plus the plugin's own `hermes ai-memory status | config | config-set | link | update`
 - **Scope that matches the other agents** — explicit config, then the checkout's `.ai-memory.toml`, then the Hermes profile
 - **Safe in non-primary runs** — cron/subagent providers neither write nor consume the single-use handoff
 - **3 tool schemas** — `ai_memory_search`, `ai_memory_write`, `ai_memory_status`
-- **94% test coverage** — linted with ruff, type-checked with mypy
+- **Multi-profile safe** — config and credentials bind during `initialize()` from the owning profile
 
 ## Quick Start
 
@@ -38,10 +37,10 @@ Hermes Agent → MemoryProvider ABC → AiMemoryProvider → AiMemoryClient → 
 
 | Layer | File | Role |
 |---|---|---|
-| `__init__.py` | Entry point | `register()` — loads config, creates provider, calls `ctx.register_memory_provider()` |
+| `__init__.py` | Entry point | `register()` — creates a fresh unbound provider for Hermes to initialize per profile |
 | `provider.py` | AiMemoryProvider | Implements `MemoryProvider` ABC; lifecycle hooks, tool dispatch |
-| `client.py` | AiMemoryClient | Typed HTTP wrapper; search, write page, send hook, fetch handoff |
-| `config.py` | AiMemoryConfig | Config dataclass + JSON persistence + env-var fallback + secret filtering |
+| `client.py` | AiMemoryClient | User API + stateless MCP client; search, write page, status, hooks, handoff |
+| `config.py` | AiMemoryConfig | Profile JSON behavior + profile-scoped credential resolution |
 | `cli.py` | CLI | `status`/`config`/`link` subcommands for `hermes memory` |
 | `plugin.yaml` | Manifest | Metadata + `python_dependencies` (Hermes validates but never installs) |
 
@@ -51,28 +50,22 @@ Hermes Agent → MemoryProvider ABC → AiMemoryProvider → AiMemoryClient → 
 |---|---|---|
 | `is_available()` | Checks `server_url` is configured | Sync |
 | `initialize()` | Resolves workspace/project, fetches the handoff once | Sync |
-| `prefetch(query, session_id)` | Consumes `queue_prefetch`'s cache, else `GET /admin/search` | Sync |
-| `queue_prefetch(query, session_id)` | `GET /admin/search` cached for the next turn | Daemon thread |
+| `prefetch(query, session_id)` | Consumes `queue_prefetch`'s cache, else `GET /api/v1/search` | Sync |
+| `queue_prefetch(query, session_id)` | `GET /api/v1/search` cached for the next turn | Hermes memory worker |
 | `recall_status()` | Hit count of the last `prefetch`, for the recall indicator | Sync |
-| `sync_turn(user, assistant)` | `POST /hook?event=user-prompt-submit` | Daemon thread |
-| `on_session_end(messages)` | `POST /hook?event=session-end` (session id only) | Daemon thread |
-| `on_memory_write(action, target, content)` | `POST /admin/write-page` for `add` / `replace` | Sync |
+| `sync_turn(user, assistant)` | When `lifecycle_capture=true`, `POST /hook?event=user-prompt-submit` | Hermes memory worker |
+| `on_session_end(messages)` | When `lifecycle_capture=true`, `POST /hook?event=session-end` (session id only) | Hermes memory worker at session boundaries |
+| `on_memory_write(action, target, content)` | No remote write; personal files stay profile-local | Sync |
 | `handle_tool_call(name, args)` | Routes to search/write/status | Sync |
 
 ## Configuration
 
-### Environment Variables
+### Profile behavior
 
-| Variable | Default | Description |
-|---|---|---|
-| `AI_MEMORY_SERVER_URL` | `http://127.0.0.1:49374` | ai-memory server address |
-| `AI_MEMORY_API_KEY` | `""` | API key (sent as Bearer token) — **env-only, never written to disk** |
-| `AI_MEMORY_AUTH_TOKEN` | `""` | Auth token (alias for api_key) — **env-only, never written to disk** |
-| `AI_MEMORY_WORKSPACE` | `""` | Workspace name, overriding the file and the `.ai-memory.toml` marker |
-| `AI_MEMORY_PROJECT` | `""` | Project name, overriding the file and the `.ai-memory.toml` marker |
-| `AI_MEMORY_SEARCH_SCOPE` | `global` | Search/recall mode: `global` or `project` |
-
-Env vars override file config, which overrides defaults. Secrets (`api_key`, `auth_token`) are **never persisted to `ai-memory.json`** — they must be set via environment variables.
+Store `server_url`, `search_scope`, `lifecycle_capture`, and any fixed workspace/project override in
+`$HERMES_HOME/ai-memory.json`. Behavior environment variables are deliberately
+ignored so one multiplexed gateway cannot leak its launch profile's routing into
+another member's assistant.
 
 ### Config File (`$HERMES_HOME/ai-memory.json`)
 
@@ -81,15 +74,18 @@ Written by `hermes memory setup` wizard. Only non-secret values are stored:
 ```json
 {
   "server_url": "http://127.0.0.1:49374",
-  "search_scope": "global"
+  "search_scope": "project",
+  "lifecycle_capture": false
 }
 ```
 
-`workspace`/`project` overrides set here (except the legacy-generated pair described below), or via `AI_MEMORY_WORKSPACE` / `AI_MEMORY_PROJECT`, are explicit: they win over the nearest applicable `.ai-memory.toml` at or above the absolute, existing session directory supplied during initialization.
+`workspace`/`project` overrides set here (except the legacy-generated pair described below) are explicit: they win over the nearest applicable `.ai-memory.toml` at or above the absolute, existing session directory supplied during initialization.
 
-`search_scope` is optional: `global` preserves legacy searches across all projects; `project` restricts search tools and both recall paths to the resolved project. For folder isolation with a single profile, use `{"search_scope": "project"}` and omit fixed workspace/project overrides so the markers can route each new session. A nested marker in `imperio_2026/apps/socorro_financeiro` takes precedence over the root marker.
+`project` is the default and restricts search tools and both recall paths to the resolved project. `global` remains an explicit opt-in. Omit fixed workspace/project overrides so `.ai-memory.toml` markers route each new session. A nested marker in `imperio_2026/apps/socorro_financeiro` takes precedence over the root marker.
 
-When scope is unknown, project searches return no results and writes (including mirrors, lifecycle hooks and handoff consumption) are blocked. An explicitly configured default project remains supported. Resolved scope from a previous initialization is never a fallback for the next one.
+When scope is unknown, project searches return no results and shared writes, lifecycle hooks and handoff consumption are blocked. Lifecycle hooks are also blocked unless `lifecycle_capture` is explicitly `true`. An explicitly configured default project remains supported. Resolved scope from a previous initialization is never a fallback for the next one.
+
+`lifecycle_capture=false` prevents lifecycle records; it does not make recall local-only. Automatic recall still sends the current query to the configured ai-memory server. Disable the external provider for conversations whose queries must remain on the workstation.
 
 **Changing folders during an existing session does not update this provider's scope.** Start a new provider/session initialized with the target directory; switching the session ID alone is insufficient. The plugin never infers the session directory from `os.getcwd()`. See [Scope Resolution](docs/reference.md#scope-resolution).
 
@@ -97,7 +93,7 @@ When scope is unknown, project searches return no results and writes (including 
 
 New installers/updaters omit fixed workspace/project values. In `hermes memory setup`, leave those prompts blank for directory routing; `search_scope` accepts only `global` or `project`. `hermes ai-memory config` also displays the read policy (not the session-specific TOML resolution).
 
-For old files, a narrow compatibility rule applies **only in project mode** (including `AI_MEMORY_SEARCH_SCOPE=project`): the complete pair `workspace=hermes`, `project=hermes-default`, with no keys other than `server_url`, `workspace`, `project`, `search_scope`, `scope_origin`, is treated as automatic unless `scope_origin=explicit`. Resolution does not rewrite the file. Global mode is unchanged. Single-key overrides, custom values, additional configuration keys, environment variables and initialization kwargs remain explicit.
+For old files, a narrow compatibility rule applies **only when the file says `search_scope=project`**: the complete pair `workspace=hermes`, `project=hermes-default`, with no keys other than `server_url`, `workspace`, `project`, `search_scope`, `scope_origin`, is treated as automatic unless `scope_origin=explicit`. Resolution does not rewrite the file. Single-key overrides, custom values, additional configuration keys and initialization kwargs remain explicit.
 
 The old format cannot prove whether an identical pair was installed automatically or typed manually. For an intentional fixed pair, set `hermes ai-memory config-set scope_origin explicit` **before enabling project mode**, or re-save the workspace/project with `config-set`. Saving a nonblank scope via setup/CLI records `scope_origin=explicit`; `automatic` is also accepted, but never demotes customized values. Blank scope inputs remove those file overrides. Invalid origin/policy values are rejected before saving.
 
@@ -105,18 +101,13 @@ For automatic folder routing, set `hermes ai-memory config-set search_scope proj
 
 ### Secrets & Security
 
-`api_key` and `auth_token` are treated as **env-only secrets**:
+`api_key` and `auth_token` are treated as **profile-scoped secrets**:
 - They are **never written** to `ai-memory.json` by `save_config()` or `hermes memory setup`
-- If they already exist in the JSON file (e.g. from a previous version), they are **stripped on next load**
-- Set them via environment variables and add to your shell profile or systemd environment:
+- If they already exist in the JSON file, they are ignored on load and stripped on the next config save
+- Put the member's key in that profile's `$HERMES_HOME/.env`:
 
 ```bash
-# Shell profile (~/.bashrc, ~/.zshrc, etc.)
-export AI_MEMORY_API_KEY=sk-your-key-here
-export AI_MEMORY_AUTH_TOKEN=your-token-here
-
-# Or systemd
-Environment="AI_MEMORY_API_KEY=sk-your-key-here"
+AI_MEMORY_API_KEY=aim_member-key
 ```
 
 The CLI shows where each secret is sourced from:

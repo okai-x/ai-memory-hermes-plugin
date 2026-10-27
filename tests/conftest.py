@@ -24,6 +24,19 @@ from config import AiMemoryConfig
 from provider import AiMemoryProvider
 
 
+def mcp_response(data: dict[str, Any]) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [{"type": "text", "text": json.dumps(data)}],
+            },
+        },
+    )
+
+
 @pytest.fixture(autouse=True)
 def isolated_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Never read the active profile or connect to a real server in this suite."""
@@ -68,26 +81,29 @@ def config() -> AiMemoryConfig:
         auth_token="test-token",
         workspace="hermes",
         project="hermes-test",
+        lifecycle_capture=True,
     )
 
 
 @pytest.fixture
 def mock_transport() -> httpx.MockTransport:
     def handler(request: httpx.Request) -> httpx.Response:
-        if "/admin/search" in request.url.path:
+        if "/api/v1/search" in request.url.path:
             return httpx.Response(
                 200,
                 json=[
                     {"path": "notes/test.md", "snippet": "test content", "score": 0.95},
                 ],
             )
-        if "/admin/write-page" in request.url.path:
-            return httpx.Response(200, json={"ok": True, "path": "notes/test.md"})
-        if "/admin/status" in request.url.path:
-            return httpx.Response(
-                200,
-                json={"ok": True, "pages": 10, "sessions": 5},
-            )
+        if "/mcp" in request.url.path:
+            payload = json.loads(request.content)
+            tool = payload["params"]["name"]
+            if tool == "memory_write_page":
+                return mcp_response({"page_id": "page-1", "path": "notes/test.md"})
+            if tool == "memory_status":
+                return mcp_response(
+                    {"counts": {"pages_latest": 10, "sessions": 5}}
+                )
         if "/hook" in request.url.path:
             return httpx.Response(200, json={"ok": True})
         if "/handoff" in request.url.path:

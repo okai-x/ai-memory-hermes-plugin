@@ -120,7 +120,7 @@ function Invoke-Preflight {
     # 6. ai-memory server
     Write-Info "Checking ai-memory server at $ServerUrl ..."
     try {
-        $response = Invoke-WebRequest -Uri "$ServerUrl/admin/status" -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
+        $response = Invoke-WebRequest -Uri "$ServerUrl/healthz" -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
         Write-Ok "ai-memory server is reachable"
     }
     catch {
@@ -248,7 +248,8 @@ if (-not (Test-Path $ConfigFile)) {
     else {
         $Config = @{
             server_url = $ServerUrl
-            search_scope = "global"
+            search_scope = "project"
+            lifecycle_capture = $false
         }
         $Config | ConvertTo-Json | Set-Content -Path $ConfigFile -Encoding UTF8
     }

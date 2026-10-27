@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -11,16 +10,12 @@ if _init_dir not in sys.path:
 # Hermes loads __init__.py as a standalone module (not a package), so
 # relative imports (from .foo import Bar) fail. Bare imports + sys.path
 # ensure sibling modules are found regardless of how the plugin is loaded.
-from config import load_config  # noqa: E402
 from provider import AiMemoryProvider  # noqa: E402
 
 __all__ = ["register"]
 
 
 def register(ctx: object) -> None:
-    hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
-    # Share config validation/env precedence with initialize() and the CLI.
-    config = load_config(hermes_home)
-
-    provider = AiMemoryProvider(config=config)
-    ctx.register_memory_provider(provider)  # type: ignore[union-attr]
+    # Registration can run in one process serving several profiles. Bind the
+    # provider only when Hermes passes that profile's home to initialize().
+    ctx.register_memory_provider(AiMemoryProvider())  # type: ignore[union-attr]

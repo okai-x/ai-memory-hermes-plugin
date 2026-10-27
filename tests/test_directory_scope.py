@@ -11,6 +11,8 @@ from client import AiMemoryClient
 from config import AiMemoryConfig, get_config_schema, load_config, save_config
 from provider import AiMemoryProvider
 
+from tests.conftest import mcp_response
+
 
 @pytest.fixture
 def http_provider(
@@ -22,8 +24,15 @@ def http_provider(
         requests.append(request)
         if request.url.path == "/handoff":
             return httpx.Response(404)
-        if request.url.path == "/admin/search":
+        if request.url.path == "/api/v1/search":
             return httpx.Response(200, json=[{"snippet": "mock recall"}])
+        if request.url.path == "/mcp":
+            payload = json.loads(request.content)
+            if payload["params"]["name"] == "memory_write_page":
+                arguments = payload["params"]["arguments"]
+                return mcp_response(
+                    {"page_id": "page-1", "path": arguments["path"]}
+                )
         return httpx.Response(200, json={"ok": True})
 
     def factory(config: AiMemoryConfig) -> AiMemoryClient:
@@ -42,17 +51,22 @@ def test_search_scope_config_roundtrip(tmp_path: Path, mode: str) -> None:
     save_config({"search_scope": mode}, str(tmp_path))
     assert load_config(str(tmp_path)).search_scope == mode
     field = next(item for item in get_config_schema() if item["key"] == "search_scope")
-    assert field["default"] == "global"
+    assert field["default"] == "project"
     assert set(field["choices"]) == {"global", "project"}
 
 
-def test_global_search_is_the_default(
+def test_project_search_is_the_default(
     http_provider: tuple[AiMemoryProvider, list[httpx.Request]],
 ) -> None:
     provider, requests = http_provider
-    assert AiMemoryConfig().search_scope == "global"
-    assert provider._search({"query": "shared"})["ok"]
-    assert dict(requests[-1].url.params) == {"q": "shared", "limit": "5"}
+    assert AiMemoryConfig().search_scope == "project"
+    result = provider._search({"query": "shared"})
+    assert result == {
+        "ok": False,
+        "error": "Project scope is unknown",
+        "results": [],
+    }
+    assert not requests
 
 
 @pytest.mark.parametrize("invalid", ["", "invalid", None])
@@ -64,25 +78,10 @@ def test_invalid_search_scope_is_rejected_without_writing(tmp_path: Path, invali
     assert not (tmp_path / "ai-memory.json").exists()
 
 
-@pytest.fixture
-def deferred_workers(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
-    from types import SimpleNamespace
-
-    workers: list[Any] = []
-
-    def thread(*, target: Any, daemon: bool) -> SimpleNamespace:
-        assert daemon
-        return SimpleNamespace(start=lambda: workers.append(target))
-
-    monkeypatch.setattr("provider.threading.Thread", thread)
-    return workers
-
-
 @pytest.mark.parametrize("directory", ["absent", "missing", "file", "unmarked", "relative"])
 def test_unknown_scope_blocks_every_write_and_handoff(
     tmp_path: Path,
     http_provider: tuple[AiMemoryProvider, list[httpx.Request]],
-    deferred_workers: list[Any],
     directory: str,
 ) -> None:
     provider, requests = http_provider
@@ -112,7 +111,6 @@ def test_unknown_scope_blocks_every_write_and_handoff(
     provider.on_memory_write("add", "memory", "private")
     provider.sync_turn("private", "answer")
     provider.on_session_end([])
-    assert not deferred_workers
     assert not requests
 
 
@@ -132,7 +130,7 @@ def test_reinitialize_does_not_reuse_previous_marker_project(
     assert not requests
 
 
-@pytest.mark.parametrize("source", ["file", "env", "kwargs"])
+@pytest.mark.parametrize("source", ["file", "kwargs"])
 def test_explicit_default_project_allows_writes_without_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -144,13 +142,11 @@ def test_explicit_default_project_allows_writes_without_cwd(
     if source == "file":
         (tmp_path / "ai-memory.json").write_text(json.dumps({"project": "hermes-default"}))
         kwargs["hermes_home"] = str(tmp_path)
-    elif source == "env":
-        monkeypatch.setenv("AI_MEMORY_PROJECT", "hermes-default")
     else:
         kwargs["project"] = "hermes-default"
     provider.initialize("explicit", **kwargs)
     assert provider._write({"path": "note.md", "body": "allowed"})["ok"]
-    payload = json.loads(requests[-1].content)
+    payload = json.loads(requests[-1].content)["params"]["arguments"]
     assert payload["project"] == "hermes-default"
     assert payload["workspace"] == "hermes"
 
@@ -183,14 +179,13 @@ def test_nearest_toml_routes_search_writes_handoff_and_hooks(
     tmp_path: Path,
     monorepo: Path,
     http_provider: tuple[AiMemoryProvider, list[httpx.Request]],
-    deferred_workers: list[Any],
     directory: str,
     workspace: str,
     project: str,
 ) -> None:
     provider, requests = http_provider
     home = tmp_path / "profile"
-    save_config({"search_scope": "project"}, str(home))
+    save_config({"search_scope": "project", "lifecycle_capture": True}, str(home))
     cwd = str(monorepo / directory)
     provider.initialize("session", cwd=cwd, hermes_home=str(home), agent_workspace="hermes")
     assert dict(requests[-1].url.params) == {
@@ -201,14 +196,10 @@ def test_nearest_toml_routes_search_writes_handoff_and_hooks(
         "q": "private", "limit": "5", "workspace": workspace, "project": project,
     }
     provider._write({"path": "note.md", "body": "test"})
-    provider.on_memory_write("add", "memory", "test")
-    for request in requests[-2:]:
-        body = json.loads(request.content)
-        assert (body["workspace"], body["project"]) == (workspace, project)
+    body = json.loads(requests[-1].content)["params"]["arguments"]
+    assert (body["workspace"], body["project"]) == (workspace, project)
     provider.sync_turn("test prompt", "test answer")
     provider.on_session_end([])
-    for worker in deferred_workers:
-        worker()
     for request in requests[-2:]:
         params = dict(request.url.params)
         assert (params["workspace"], params["project"]) == (workspace, project)
@@ -216,7 +207,7 @@ def test_nearest_toml_routes_search_writes_handoff_and_hooks(
         assert params["session_id"] == "session"
 
 
-@pytest.mark.parametrize("source", ["file", "env", "kwargs"])
+@pytest.mark.parametrize("source", ["file", "kwargs"])
 def test_explicit_scope_overrides_nested_toml(
     tmp_path: Path,
     monorepo: Path,
@@ -230,9 +221,6 @@ def test_explicit_scope_overrides_nested_toml(
     kwargs: dict[str, Any] = {"hermes_home": str(home)}
     if source == "file":
         save_config({"workspace": "override-ws", "project": "override-project"}, str(home))
-    elif source == "env":
-        monkeypatch.setenv("AI_MEMORY_WORKSPACE", "override-ws")
-        monkeypatch.setenv("AI_MEMORY_PROJECT", "override-project")
     else:
         kwargs.update(ai_memory_workspace="override-ws", project="override-project")
     provider.initialize("session", cwd=str(monorepo / "apps/socorro_financeiro/src"), **kwargs)
@@ -240,13 +228,13 @@ def test_explicit_scope_overrides_nested_toml(
     assert requests[-1].url.params["workspace"] == "override-ws"
     assert requests[-1].url.params["project"] == "override-project"
     provider._write({"path": "note.md", "body": "allowed"})
-    assert json.loads(requests[-1].content)["project"] == "override-project"
+    payload = json.loads(requests[-1].content)["params"]["arguments"]
+    assert payload["project"] == "override-project"
 
 
 def test_project_search_does_not_fall_back_to_global_when_scope_is_unknown(
     tmp_path: Path,
     http_provider: tuple[AiMemoryProvider, list[httpx.Request]],
-    deferred_workers: list[Any],
 ) -> None:
     provider, requests = http_provider
     save_config({"search_scope": "project"}, str(tmp_path))
@@ -256,7 +244,6 @@ def test_project_search_does_not_fall_back_to_global_when_scope_is_unknown(
     assert result["results"] == []
     assert provider.prefetch("private") == ""
     provider.queue_prefetch("private")
-    assert not deferred_workers
     assert not requests
 
 
@@ -265,15 +252,12 @@ def test_queue_prefetch_uses_configured_scope_and_real_cache_update(
     tmp_path: Path,
     monorepo: Path,
     http_provider: tuple[AiMemoryProvider, list[httpx.Request]],
-    deferred_workers: list[Any],
     mode: str,
 ) -> None:
     provider, requests = http_provider
     save_config({"search_scope": mode}, str(tmp_path))
     provider.initialize("session", cwd=str(monorepo), hermes_home=str(tmp_path))
     provider.queue_prefetch("test")
-    assert not provider._prefetch_cache
-    deferred_workers.pop()()
     key = ("session", mode, "imperio", "imperio_2026", "test")
     assert key in provider._prefetch_cache
     params = dict(requests[-1].url.params)
@@ -286,35 +270,29 @@ def test_queue_prefetch_uses_configured_scope_and_real_cache_update(
     assert len(requests) == count
 
 
-def test_queued_work_keeps_original_client_and_scope_after_reinitialize(
+def test_reinitialize_clears_completed_work_and_rebinds_scope(
     monorepo: Path,
     http_provider: tuple[AiMemoryProvider, list[httpx.Request]],
-    deferred_workers: list[Any],
 ) -> None:
     provider, requests = http_provider
     provider.initialize("old", cwd=str(monorepo), ai_memory_server_url="http://old.invalid")
     provider.sync_turn("original", "answer")
     provider.on_session_end([])
     provider.queue_prefetch("old query")
-    provider.initialize("new", cwd=str(monorepo / "apps/socorro_financeiro"))
-    requests.clear()
-    for worker in deferred_workers:
-        worker()
     assert requests
-    assert all(request.url.host == "old.invalid" for request in requests)
-    for request in requests[:2]:
-        assert request.url.params["project"] == "imperio_2026"
-        assert request.url.params["session_id"] == "old"
-    assert not provider._prefetch_cache  # A stale worker must not repopulate it.
+    assert provider._prefetch_cache
+    provider.initialize("new", cwd=str(monorepo / "apps/socorro_financeiro"))
+    assert not provider._prefetch_cache
+    assert provider._config.project == "socorro_financeiro"
 
 
-def test_initialize_without_home_honors_search_scope_environment(
+def test_initialize_without_home_ignores_search_scope_environment(
     monorepo: Path,
     monkeypatch: pytest.MonkeyPatch,
     http_provider: tuple[AiMemoryProvider, list[httpx.Request]],
 ) -> None:
     provider, requests = http_provider
-    monkeypatch.setenv("AI_MEMORY_SEARCH_SCOPE", "project")
+    monkeypatch.setenv("AI_MEMORY_SEARCH_SCOPE", "global")
     provider.initialize("session", cwd=str(monorepo))
     provider._search({"query": "private"})
     assert requests[-1].url.params["project"] == "imperio_2026"
@@ -337,12 +315,11 @@ def test_cache_is_not_reused_between_search_modes(
     tmp_path: Path,
     monorepo: Path,
     http_provider: tuple[AiMemoryProvider, list[httpx.Request]],
-    deferred_workers: list[Any],
 ) -> None:
     provider, requests = http_provider
+    provider._config.search_scope = "global"
     provider.initialize("session", cwd=str(monorepo))
     provider.queue_prefetch("query")
-    deferred_workers.pop()()
     provider._config.search_scope = "project"
     requests.clear()
     assert provider.prefetch("query") == "mock recall"
@@ -352,17 +329,17 @@ def test_cache_is_not_reused_between_search_modes(
 def test_session_switch_discards_late_cache_without_dynamic_scope_change(
     monorepo: Path,
     http_provider: tuple[AiMemoryProvider, list[httpx.Request]],
-    deferred_workers: list[Any],
 ) -> None:
     provider, requests = http_provider
     provider.initialize("old", cwd=str(monorepo))
     provider.queue_prefetch("query")
+    assert provider._prefetch_cache
     provider.on_session_switch("new", cwd=str(monorepo / "apps/socorro_financeiro"))
-    deferred_workers.pop()()
     assert not provider._prefetch_cache
     assert provider._config.project == "imperio_2026"
     provider._write({"path": "note.md", "body": "same construction scope"})
-    assert json.loads(requests[-1].content)["project"] == "imperio_2026"
+    payload = json.loads(requests[-1].content)["params"]["arguments"]
+    assert payload["project"] == "imperio_2026"
 
 
 def test_failed_reinitialize_cannot_write_to_previous_project(

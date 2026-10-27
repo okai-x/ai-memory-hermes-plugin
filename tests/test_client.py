@@ -29,7 +29,7 @@ def client() -> AiMemoryClient:
 def test_client_search_success(client: AiMemoryClient) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
-        assert request.url.path == "/admin/search"
+        assert request.url.path == "/api/v1/search"
         assert request.headers["Authorization"] == "Bearer test-token"
         assert dict(request.url.params) == {
             "q": "test query",
@@ -57,35 +57,84 @@ def test_client_search_raises_on_http_error(client: AiMemoryClient) -> None:
 def test_client_write_page_success(client: AiMemoryClient) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"
+        assert request.url.path == "/mcp"
+        assert request.headers["accept"] == "application/json, text/event-stream"
         body = json.loads(request.content)
-        assert body["path"] == "notes/test.md"
-        assert body["body"] == "# Hello"
-        return httpx.Response(200, json={"ok": True, "path": "notes/test.md"})
+        assert body["method"] == "tools/call"
+        assert body["params"] == {
+            "name": "memory_write_page",
+            "arguments": {"path": "notes/test.md", "body": "# Hello"},
+        }
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {"page_id": "page-1", "path": "notes/test.md"}
+                            ),
+                        }
+                    ]
+                },
+            },
+        )
 
     client._transport = httpx.MockTransport(handler)
     result = client.write_page("notes/test.md", "# Hello")
-    assert result["ok"] is True
+    assert result == {"page_id": "page-1", "path": "notes/test.md"}
 
 
 def test_client_write_page_with_tags(client: AiMemoryClient) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert body["tags"] == ["test", "docs"]
-        return httpx.Response(200, json={"ok": True})
+        assert body["params"]["arguments"]["tags"] == ["test", "docs"]
+        return _mcp_response({"page_id": "page-1", "path": "notes/test.md"})
 
     client._transport = httpx.MockTransport(handler)
     result = client.write_page("notes/test.md", "# Hello", tags=["test", "docs"])
-    assert result["ok"] is True
+    assert result["page_id"] == "page-1"
 
 
 def test_client_status_success(client: AiMemoryClient) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"ok": True, "pages": 10})
+        body = json.loads(request.content)
+        assert request.url.path == "/mcp"
+        assert body["params"] == {"name": "memory_status", "arguments": {}}
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps({"counts": {"pages_latest": 10}}),
+                        }
+                    ]
+                },
+            },
+        )
 
     client._transport = httpx.MockTransport(handler)
     result = client.status()
-    assert result["ok"] is True
-    assert result["pages"] == 10
+    assert result["counts"]["pages_latest"] == 10
+
+
+def test_client_marks_machine_routes_as_hermes(client: AiMemoryClient) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(404)
+
+    client._transport = httpx.MockTransport(handler)
+    assert client.fetch_handoff() is None
+    assert seen[0].headers["x-ai-memory-client"] == "hermes"
 
 
 def test_client_status_raises_on_connection_error(client: AiMemoryClient) -> None:
@@ -249,13 +298,25 @@ def _ok_response(json_data: object) -> httpx.Response:
     )
 
 
+def _mcp_response(data: dict[str, object]) -> httpx.Response:
+    return _ok_response(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [{"type": "text", "text": json.dumps(data)}],
+            },
+        }
+    )
+
+
 def test_client_search_uses_search_timeout(client: AiMemoryClient) -> None:
     client._request = MagicMock()
     client._request.return_value = _ok_response([])
     client.search("test query")
     client._request.assert_called_once_with(
         "GET",
-        "/admin/search",
+        "/api/v1/search",
         params={"q": "test query", "limit": 3},
         timeout=SEARCH_TIMEOUT,
     )
@@ -295,13 +356,14 @@ def test_client_search_normalizes_legacy_envelope_and_applies_limit(client: AiMe
 def test_client_write_page_with_tier_and_pinned(client: AiMemoryClient) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert body["tier"] == "semantic"
-        assert body["pinned"] is True
-        return httpx.Response(200, json={"ok": True})
+        arguments = body["params"]["arguments"]
+        assert arguments["tier"] == "semantic"
+        assert arguments["pinned"] is True
+        return _mcp_response({"page_id": "page-1", "path": "notes/test.md"})
 
     client._transport = httpx.MockTransport(handler)
     result = client.write_page("notes/test.md", "# Hello", tier="semantic", pinned=True)
-    assert result["ok"] is True
+    assert result["page_id"] == "page-1"
 
 
 def test_client_send_hook_passes_cwd(client: AiMemoryClient) -> None:
@@ -349,7 +411,9 @@ def test_client_clears_failure_state_after_a_successful_request(
     with pytest.raises(httpx.ConnectError):
         client.status()
 
-    client._transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True}))
+    client._transport = httpx.MockTransport(
+        lambda request: _mcp_response({"counts": {"pages_latest": 0}})
+    )
     client.status()
     assert client.last_failure() == ""
 

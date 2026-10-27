@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import time
@@ -38,7 +39,10 @@ class AiMemoryClient:
     def __init__(self, config: AiMemoryConfig) -> None:
         self.config = config
         self._base = config.server_url.rstrip("/")
-        headers: dict[str, str] = {"Content-Type": "application/json"}
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "X-AI-Memory-Client": "hermes",
+        }
         token = config.auth_token or config.api_key
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -85,7 +89,8 @@ class AiMemoryClient:
             raise RuntimeError(f"ai-memory requests paused: {self._last_failure}")
         url = f"{self._base}{path}"
         extra_headers = kwargs.pop("headers", {})
-        headers = {**self._client.headers, **extra_headers}
+        headers = self._client.headers.copy()
+        headers.update(extra_headers)
         timeout = kwargs.pop("timeout", SEARCH_TIMEOUT)
         try:
             if self._transport:
@@ -108,10 +113,7 @@ class AiMemoryClient:
         project: str | None = None,
         limit: int = 3,
     ) -> list[dict[str, Any]]:
-        """Full-text search the ai-memory wiki.
-
-        ai-memory 1.28.1 exposes ``GET /admin/search?q=&limit=``; the
-        ``POST /api/v1/search`` this used to call does not exist and 404s.
+        """Full-text search the ai-memory wiki through its user API.
 
         Scope is all-or-nothing. ai-memory resolves a project *within* a
         workspace, so a lone ``project=`` has no workspace to resolve
@@ -123,7 +125,7 @@ class AiMemoryClient:
         if workspace and project:
             params["workspace"] = workspace
             params["project"] = project
-        r = self._request("GET", "/admin/search", params=params, timeout=SEARCH_TIMEOUT)
+        r = self._request("GET", "/api/v1/search", params=params, timeout=SEARCH_TIMEOUT)
         r.raise_for_status()
         data = r.json()
         if isinstance(data, dict):
@@ -132,6 +134,62 @@ class AiMemoryClient:
             log.warning("search response has unexpected type: %s", type(data).__name__)
             return []
         return [item for item in data if isinstance(item, dict)][:limit]
+
+    def _mcp_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        timeout: float = WRITE_TIMEOUT,
+    ) -> dict[str, Any]:
+        """Call one ai-memory tool over its default stateless HTTP MCP transport."""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }
+        response = self._request(
+            "POST",
+            "/mcp",
+            json=payload,
+            headers={"Accept": "application/json, text/event-stream"},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        error = data.get("error") if isinstance(data, dict) else None
+        if error:
+            message = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+            raise RuntimeError(f"ai-memory MCP {name} failed: {message}")
+        result = data.get("result") if isinstance(data, dict) else None
+        if not isinstance(result, dict):
+            raise RuntimeError(f"ai-memory MCP {name} returned no result")
+        text = self._content_text(result)
+        if result.get("isError"):
+            raise RuntimeError(f"ai-memory MCP {name} failed: {text}")
+        if not text:
+            return {}
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"ai-memory MCP {name} returned invalid JSON") from exc
+        if not isinstance(decoded, dict):
+            raise RuntimeError(
+                f"ai-memory MCP {name} returned {type(decoded).__name__}, expected object"
+            )
+        return decoded
+
+    @staticmethod
+    def _content_text(result: dict[str, Any]) -> str:
+        content = result.get("content", [])
+        if not isinstance(content, list):
+            return ""
+        return "\n".join(
+            str(item.get("text", ""))
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        ).strip()
 
     def write_page(
         self,
@@ -154,14 +212,20 @@ class AiMemoryClient:
             payload["workspace"] = workspace
         if project:
             payload["project"] = project
-        r = self._request("POST", "/admin/write-page", json=payload, timeout=WRITE_TIMEOUT)
-        r.raise_for_status()
-        return r.json()
+        return self._mcp_call("memory_write_page", payload)
 
-    def status(self) -> dict[str, Any]:
-        r = self._request("GET", "/admin/status", timeout=SEARCH_TIMEOUT)
-        r.raise_for_status()
-        return r.json()
+    def status(
+        self,
+        workspace: str | None = None,
+        project: str | None = None,
+    ) -> dict[str, Any]:
+        arguments: dict[str, Any] = {}
+        if workspace and project:
+            arguments.update(workspace=workspace, project=project)
+        return self._mcp_call("memory_status", arguments, timeout=SEARCH_TIMEOUT)
+
+    def close(self) -> None:
+        self._client.close()
 
     def send_hook(
         self,
@@ -231,7 +295,6 @@ class AiMemoryClient:
         if r.status_code == 404:
             return None
         r.raise_for_status()
-        # ai-memory 1.28.1 returns the handoff as a markdown block, not a
-        # JSON envelope: r.json() raised here on every call.
+        # The handoff route returns a markdown block, not a JSON envelope.
         text = (r.text or "").strip()
         return text or None

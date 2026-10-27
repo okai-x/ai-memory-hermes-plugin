@@ -162,7 +162,7 @@ preflight() {
 
   # 8. ai-memory server
   info "Checking ai-memory server at $AI_MEMORY_SERVER_URL ..."
-  if curl -sf --connect-timeout 3 "$AI_MEMORY_SERVER_URL/admin/status" >/dev/null 2>&1; then
+  if curl -sf --connect-timeout 3 "$AI_MEMORY_SERVER_URL/healthz" >/dev/null 2>&1; then
     ok "ai-memory server is reachable"
   else
     warn "ai-memory server at $AI_MEMORY_SERVER_URL is not reachable."
@@ -298,7 +298,8 @@ if [ "$DRY_RUN" != "true" ]; then
     cat > "$CONFIG_FILE" <<EOF
 {
   "server_url": "$AI_MEMORY_SERVER_URL",
-  "search_scope": "global"
+  "search_scope": "project",
+  "lifecycle_capture": false
 }
 EOF
     info "Config:      $CONFIG_FILE (created)"

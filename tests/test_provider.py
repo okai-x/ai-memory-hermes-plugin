@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -18,6 +17,7 @@ def provider(monkeypatch: pytest.MonkeyPatch) -> AiMemoryProvider:
         auth_token="test-token",
         workspace="hermes",
         project="hermes-test",
+        lifecycle_capture=True,
     )
     p = AiMemoryProvider(config=cfg)
     # initialize() now fetches a handoff; keep unit tests off the
@@ -114,6 +114,9 @@ def test_handle_tool_call_status(provider: AiMemoryProvider) -> None:
     provider._client.status = MagicMock(return_value={"ok": True, "pages": 10})
     result = json.loads(provider.handle_tool_call("ai_memory_status", {}))
     assert result["ok"] is True
+    provider._client.status.assert_called_once_with(
+        workspace="hermes", project="hermes-test"
+    )
 
 
 def test_handle_tool_call_returns_json_string(provider: AiMemoryProvider) -> None:
@@ -156,11 +159,22 @@ def test_prefetch_returns_empty_on_no_results(provider: AiMemoryProvider) -> Non
     assert result == ""
 
 
-def test_sync_turn_spawns_daemon(provider: AiMemoryProvider) -> None:
+def test_sync_turn_runs_on_hermes_worker(provider: AiMemoryProvider) -> None:
     provider._client.send_hook = MagicMock()
     provider.sync_turn("user msg", "assistant msg", session_id="sess-1")
-    time.sleep(0.05)
     provider._client.send_hook.assert_called_once()
+
+
+def test_lifecycle_capture_is_disabled_by_default() -> None:
+    provider = AiMemoryProvider(config=AiMemoryConfig(
+        workspace="hermes", project="hermes-test",
+    ))
+    provider._client.send_hook = MagicMock()
+
+    provider.sync_turn("private prompt", "assistant", session_id="sess-1")
+    provider.on_session_end([{"role": "user", "content": "private prompt"}])
+
+    provider._client.send_hook.assert_not_called()
 
 
 def test_sync_turn_absorbs_extra_kwargs(provider: AiMemoryProvider) -> None:
@@ -168,34 +182,31 @@ def test_sync_turn_absorbs_extra_kwargs(provider: AiMemoryProvider) -> None:
     provider.sync_turn(
         "user msg", "assistant msg", session_id="sess-1", context="extra", extra_key="val"
     )
-    time.sleep(0.05)
     provider._client.send_hook.assert_called_once()
 
 
-def test_on_session_end_spawns_daemon(provider: AiMemoryProvider) -> None:
+def test_on_session_end_runs_on_hermes_worker(provider: AiMemoryProvider) -> None:
     provider._client.send_hook = MagicMock()
     provider.on_session_end([{"role": "user", "content": "hello"}])
-    time.sleep(0.05)
     provider._client.send_hook.assert_called_once()
 
 
 def test_on_session_end_absorbs_extra_kwargs(provider: AiMemoryProvider) -> None:
     provider._client.send_hook = MagicMock()
     provider.on_session_end([{"role": "user", "content": "hello"}], extra_key="val")
-    time.sleep(0.05)
     provider._client.send_hook.assert_called_once()
 
 
-def test_on_memory_write_calls_client(provider: AiMemoryProvider) -> None:
+def test_on_memory_write_keeps_personal_memory_local(provider: AiMemoryProvider) -> None:
     provider._client.write_page = MagicMock()
     provider.on_memory_write("write", "notes/foo", "# content")
-    provider._client.write_page.assert_called_once()
+    provider._client.write_page.assert_not_called()
 
 
 def test_on_memory_write_with_metadata(provider: AiMemoryProvider) -> None:
     provider._client.write_page = MagicMock()
     provider.on_memory_write("write", "notes/foo", "# content", metadata={"tags": ["test"]})
-    provider._client.write_page.assert_called_once()
+    provider._client.write_page.assert_not_called()
 
 
 def test_on_memory_write_skips_other_actions(provider: AiMemoryProvider) -> None:
@@ -219,7 +230,9 @@ def test_queue_prefetch_fills_the_next_prefetch(
     )
     provider.queue_prefetch("test query", session_id="sess-9")
     wait_for_prefetch(provider, "test query", "sess-9")
-    provider._client.search.assert_called_once_with(query="test query", limit=3)
+    provider._client.search.assert_called_once_with(
+        query="test query", limit=3, workspace="hermes", project="hermes-test"
+    )
 
     provider._search = MagicMock(side_effect=AssertionError("cache miss"))
     result = provider.prefetch("test query", session_id="sess-9")
@@ -285,22 +298,16 @@ def test_search_schema_declares_its_required_argument(provider: AiMemoryProvider
 
 
 def test_on_memory_write_mirrors_add(provider: AiMemoryProvider) -> None:
-    """Hermes announces built-in writes as add|replace|remove."""
+    """Built-in personal memory is never copied into the team wiki."""
     provider._client.write_page = MagicMock()
     provider.on_memory_write("add", "memory", "# entry")
-    kwargs = provider._client.write_page.call_args.kwargs
-    assert kwargs["path"] == "hermes-memory/memory.md"
-    assert kwargs["body"] == "# entry"
-    assert kwargs["tags"] == ["hermes", "mirror"]
+    provider._client.write_page.assert_not_called()
 
 
-def test_on_memory_write_replace_keeps_previous_content(provider: AiMemoryProvider) -> None:
+def test_on_memory_write_replace_stays_local(provider: AiMemoryProvider) -> None:
     provider._client.write_page = MagicMock()
     provider.on_memory_write("replace", "user", "# novo", metadata={"previous_content": "# antigo"})
-    assert provider._client.write_page.call_args.kwargs["path"] == "hermes-memory/user.md"
-    body = provider._client.write_page.call_args.kwargs["body"]
-    assert "# novo" in body
-    assert "# antigo" in body
+    provider._client.write_page.assert_not_called()
 
 
 def test_on_memory_write_skips_remove(provider: AiMemoryProvider) -> None:

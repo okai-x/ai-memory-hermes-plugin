@@ -9,7 +9,7 @@
 **Check:**
 ```bash
 # Is the server running?
-curl http://127.0.0.1:49374/admin/status
+curl http://127.0.0.1:49374/healthz
 
 # What URL is configured?
 hermes ai-memory config
@@ -17,7 +17,7 @@ hermes ai-memory config
 
 **Fix:**
 - Start ai-memory: `ai-memory serve`
-- Set the correct URL: `export AI_MEMORY_SERVER_URL=http://host:port`
+- Set the correct URL: `hermes ai-memory config-set server_url http://host:port`
 - Re-run `hermes memory setup`
 
 ### Connection Refused
@@ -30,7 +30,7 @@ hermes ai-memory config
 ss -tlnp | grep 49374
 
 # If ai-memory binds to a different port, update config
-export AI_MEMORY_SERVER_URL=http://127.0.0.1:3113
+hermes ai-memory config-set server_url http://127.0.0.1:3113
 ```
 
 ## Authentication
@@ -47,14 +47,9 @@ hermes ai-memory config
 ```
 
 **Fix:**
-- Set the correct key via environment variable:
+- Put the correct member key in the active profile's `.env`:
   ```bash
-  export AI_MEMORY_API_KEY=sk-...
-  ```
-- Add to shell profile for persistence:
-  ```bash
-  echo 'export AI_MEMORY_API_KEY=sk-...' >> ~/.bashrc
-  source ~/.bashrc
+  printf '%s\n' 'AI_MEMORY_API_KEY=aim_member-key' >> "$HERMES_HOME/.env"
   ```
 - Or re-run `hermes memory setup`
 
@@ -62,7 +57,7 @@ hermes ai-memory config
 
 **Cause:** Older plugin versions may have persisted `api_key` or `auth_token` to the config file in plaintext.
 
-**Fix:** The plugin now strips secrets from the JSON file on load. To manually clean up:
+**Fix:** The plugin ignores secrets found in the JSON file; the next config save removes them. To manually clean up:
 
 ```bash
 # Check if secrets exist in the config
@@ -250,7 +245,8 @@ The plugin inserts its directory into `sys.path` at import time, but some Hermes
 **Check:**
 ```bash
 # Direct search
-curl "http://127.0.0.1:49374/admin/search?q=test"
+curl "http://127.0.0.1:49374/api/v1/search?q=test&workspace=my-team&project=my-project" \
+  -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN"
 ```
 
 **Note:** The plugin returns empty string on no results — this is normal. The agent will see no injected context and rely on explicit `ai_memory_search` tool calls.
@@ -261,19 +257,21 @@ curl "http://127.0.0.1:49374/admin/search?q=test"
 
 **Check:** Server health, network.
 
-**Note:** `sync_turn` runs on a daemon thread with error swallowing. If the server is slow, the thread may accumulate. The plugin caps at one thread per turn — no queue.
+**Note:** Hermes runs `sync_turn` on its serialized, profile-bound memory worker. The request timeout prevents an unavailable server from blocking that worker indefinitely.
 
-### Memory Not Mirroring
+### Personal Memory Is Not in the Team Wiki
 
-**Cause:** The mirrored actions are `add` and `replace` — what Hermes announces for a built-in `MEMORY.md` / `USER.md` write. `write` and `append` are still accepted as synonyms for older callers.
-
-`remove` is skipped on purpose: the native store owns the deletion, and the mirror keeps the page history instead of writing a tombstone. A `replace` carries the superseded entry in `metadata["previous_content"]` and the page keeps it under `## Substituído`.
+**Cause:** This is intentional. Built-in `MEMORY.md` and `USER.md` stay in each
+member's Hermes profile. Write team knowledge explicitly with
+`ai_memory_write`. Conversation capture is disabled by default; set
+`lifecycle_capture=true` only
+for projects whose members have agreed to share prompts.
 
 ### Recall Context Looks Unattributed
 
-**Cause:** Recall spans every project (that is what makes cross-agent recall work), so each injected hit is labelled `<title> (<path>): <snippet>`.
+**Cause:** Each injected hit is labelled `<title> (<path>): <snippet>` so its source remains visible.
 
-If the hits belong to a project you did not expect, check the resolved scope: a `workspace`/`project` set in `ai-memory.json` or via `AI_MEMORY_WORKSPACE` / `AI_MEMORY_PROJECT` wins over the checkout's `.ai-memory.toml`.
+If the hits belong to a project you did not expect, check the resolved scope: a `workspace`/`project` set in `ai-memory.json` wins over the checkout's `.ai-memory.toml`.
 
 ## Testing
 
@@ -286,17 +284,9 @@ rm -rf .pytest_cache
 uv run pytest --cov -v
 ```
 
-### "Cannot schedule new futures" on Shutdown
-
-This is a known CPython shutdown race with daemon threads. ai-memory plugin uses daemon threads that may fire during interpreter teardown. The error is harmless (logged at debug level). Set `PYTHONWARNINGS=ignore` if it's noisy:
-
-```bash
-export PYTHONWARNINGS=ignore
-```
-
 ## Known Limitations
 
 - **Pause instead of a full circuit breaker:** after `FAILURE_THRESHOLD` (3) consecutive transport failures the client stops calling the server for `COOLDOWN_SECONDS` (60s) and reports the reason through `unavailable_reason()`. A successful request clears the state immediately.
-- **No durable write queue:** Turn sync is fire-and-forget. If the server is down, that turn is lost — ai-memory applies its own durable spool for hooks it does receive.
+- **No plugin-side durable queue:** Hermes serializes pending calls in memory. If the process exits while the server is down, an unsent turn is lost; ai-memory durably spools hooks it receives.
 - **Session end posts no transcript:** ai-memory reads no body field on `session-end`, so the event carries the session id only. Re-close a lost session with `ai-memory finalize-session --agent hermes`.
 - **Single active provider:** Only one Hermes memory provider can be active at a time, selected via `memory.provider` in config.

@@ -355,7 +355,7 @@ class AiMemoryProvider(MemoryProvider):
         return "\n\n".join(lines)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Recall in the background so the next turn's prefetch is a cache hit.
+        """Recall so Hermes' background worker can cache the next turn.
 
         Hermes calls this after each turn with that turn's ``session_id``;
         Cache keys include session, search mode, workspace, project and query.
@@ -369,22 +369,19 @@ class AiMemoryProvider(MemoryProvider):
             return
         key = context.cache_key(query)
 
-        def _do() -> None:
-            try:
-                hits = context.client.search(
-                    query=query, limit=_PREFETCH_RESULTS, **context.search_params()
-                )
-            except Exception:
-                log.warning("ai-memory queue_prefetch failed", exc_info=True)
+        try:
+            hits = context.client.search(
+                query=query, limit=_PREFETCH_RESULTS, **context.search_params()
+            )
+        except Exception:
+            log.warning("ai-memory queue_prefetch failed", exc_info=True)
+            return
+        with self._lock:
+            if context.generation != self._generation:
                 return
-            with self._lock:
-                if context.generation != self._generation:
-                    return
-                self._prefetch_cache[key] = hits
-                while len(self._prefetch_cache) > _PREFETCH_CACHE_MAX:
-                    self._prefetch_cache.pop(next(iter(self._prefetch_cache)))
-
-        threading.Thread(target=_do, daemon=True).start()
+            self._prefetch_cache[key] = hits
+            while len(self._prefetch_cache) > _PREFETCH_CACHE_MAX:
+                self._prefetch_cache.pop(next(iter(self._prefetch_cache)))
 
     def recall_status(self) -> RecallStatus | None:
         """Hit count from the most recent ``prefetch``, for Hermes's indicator."""
@@ -394,99 +391,53 @@ class AiMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user: str, assistant: str, *, session_id: str = "", **kwargs: Any) -> None:
         context = self._snapshot(session_id)
-        if not self._has_write_scope(context):
+        if not self._config.lifecycle_capture or not self._has_write_scope(context):
             return
         sid, ws, proj, cwd = (
             context.session_id, context.workspace, context.project, context.cwd
         )
 
-        def _do() -> None:
-            try:
-                # ai-memory's own lifecycle event. The previous
-                # event="user-prompt" with a {user, assistant} body was
-                # accepted with 202 and then stored with an EMPTY body,
-                # because ai-memory reads `prompt` off a
-                # `user-prompt-submit` payload. Every Hermes turn was lost.
-                context.client.send_hook(
-                    event="user-prompt-submit",
-                    session_id=sid,
-                    payload={"session_id": sid, "prompt": user},
-                    workspace=ws,
-                    project=proj,
-                    cwd=cwd,
-                )
-            except Exception:
-                log.warning("ai-memory sync_turn failed", exc_info=True)
-
-        threading.Thread(target=_do, daemon=True).start()
+        # The memory manager runs this on its profile-bound background worker.
+        # ai-memory reads ``prompt`` from a ``user-prompt-submit`` payload.
+        try:
+            context.client.send_hook(
+                event="user-prompt-submit",
+                session_id=sid,
+                payload={"session_id": sid, "prompt": user},
+                workspace=ws,
+                project=proj,
+                cwd=cwd,
+            )
+        except Exception:
+            log.warning("ai-memory sync_turn failed", exc_info=True)
 
     def on_session_end(self, messages: list[dict[str, Any]], **kwargs: Any) -> None:
         context = self._snapshot()
-        if not self._has_write_scope(context):
+        if not self._config.lifecycle_capture or not self._has_write_scope(context):
             return
         sid, ws, proj, cwd = (
             context.session_id, context.workspace, context.project, context.cwd
         )
 
-        def _do() -> None:
-            try:
-                # ai-memory reads no body field on SessionEnd: the event closes
-                # the session, synthesizes sessions/<id>.md and writes the auto
-                # handoff. Posting the transcript only risked the 0.5s turn-hook
-                # timeout dropping the close, so the payload stays minimal and
-                # the call gets the write budget instead.
-                context.client.send_hook(
-                    event="session-end",
-                    session_id=sid,
-                    payload={"session_id": sid},
-                    workspace=ws,
-                    project=proj,
-                    cwd=cwd,
-                    timeout=SESSION_END_TIMEOUT,
-                )
-            except Exception:
-                log.warning("ai-memory on_session_end failed", exc_info=True)
-
-        threading.Thread(target=_do, daemon=True).start()
-
-    # Hermes announces built-in memory writes as add|replace|remove; write and
-    # append are kept as synonyms for older callers of this hook.
-    _MIRRORED_ACTIONS = ("add", "replace", "write", "append")
-    _REPLACED_HEADING = "## Substituído"
+        # SessionEnd closes the session, synthesizes its page and creates the
+        # automatic handoff; ai-memory does not consume the transcript body.
+        try:
+            context.client.send_hook(
+                event="session-end",
+                session_id=sid,
+                payload={"session_id": sid},
+                workspace=ws,
+                project=proj,
+                cwd=cwd,
+                timeout=SESSION_END_TIMEOUT,
+            )
+        except Exception:
+            log.warning("ai-memory on_session_end failed", exc_info=True)
 
     def on_memory_write(
         self, action: str, target: str, content: str, metadata: dict[str, Any] | None = None
     ) -> None:
-        """Mirror a built-in `MEMORY.md` / `USER.md` write into the wiki.
-
-        ``remove`` is the native store deleting an entry it owns: the mirror
-        keeps the page history instead of writing a tombstone, so it is
-        skipped. A ``replace`` carries the superseded entry in
-        ``metadata["previous_content"]``, which is kept in the mirrored page so
-        the replacement does not silently drop it.
-        """
-        context = self._snapshot()
-        if not self._has_write_scope(context):
-            return
-        if action not in self._MIRRORED_ACTIONS:
-            return
-
-        meta = metadata or {}
-        previous = str(meta.get("previous_content") or meta.get("old_text") or "")
-        body = content
-        if action == "replace" and previous:
-            body = f"{content}\n\n{self._REPLACED_HEADING}\n\n{previous}"
-
-        try:
-            context.client.write_page(
-                path=f"hermes-memory/{target}.md",
-                body=body,
-                tags=["hermes", "mirror"],
-                workspace=context.workspace,
-                project=context.project,
-            )
-        except Exception:
-            log.warning("on_memory_write hook failed", exc_info=True)
+        """Keep Hermes' personal MEMORY.md and USER.md in the member's profile."""
 
     def on_session_switch(
         self,
@@ -515,7 +466,7 @@ class AiMemoryProvider(MemoryProvider):
                 self._handoff_context = None
 
     def shutdown(self) -> None:
-        pass
+        self._client.close()
 
     def _search(
         self, args: dict[str, Any], *, context: _OperationContext | None = None
@@ -548,4 +499,10 @@ class AiMemoryProvider(MemoryProvider):
         return {"ok": True, "written": args.get("path")}
 
     def _status(self) -> dict[str, Any]:
-        return self._client.status()
+        context = self._snapshot()
+        if context.scope_known:
+            return context.client.status(
+                workspace=context.workspace,
+                project=context.project,
+            )
+        return context.client.status()

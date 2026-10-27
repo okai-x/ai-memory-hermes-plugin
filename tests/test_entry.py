@@ -32,6 +32,25 @@ def test_register_calls_register_memory_provider() -> None:
     ctx.register_memory_provider.assert_called_once()
 
 
+def test_register_does_not_bind_the_launch_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from __init__ import register
+
+    launch_home = tmp_path / "launch-profile"
+    launch_home.mkdir()
+    (launch_home / "ai-memory.json").write_text(
+        json.dumps({"server_url": "http://launch.invalid:49374"})
+    )
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+
+    ctx = MagicMock()
+    register(ctx)
+    provider = ctx.register_memory_provider.call_args.args[0]
+
+    assert provider._config.server_url == "http://127.0.0.1:49374"
+
+
 def test_register_passes_ai_memory_provider_instance() -> None:
     from __init__ import register
     from provider import AiMemoryProvider
@@ -93,6 +112,9 @@ def test_register_loads_config_from_file(tmp_path: Path, monkeypatch: pytest.Mon
     register(ctx)
     args, _ = ctx.register_memory_provider.call_args
     provider = args[0]
+    provider.initialize(
+        "session", hermes_home=str(hermes_home), agent_context="subagent"
+    )
     assert provider._config.server_url == "http://custom:49374"
     assert provider._config.project == "custom-project"
     assert provider._config.workspace == "hermes"
@@ -115,10 +137,15 @@ def test_register_handles_corrupt_config_file(
     register(ctx)
     args, _ = ctx.register_memory_provider.call_args
     provider = args[0]
+    provider.initialize(
+        "session", hermes_home=str(hermes_home), agent_context="subagent"
+    )
     assert provider._config.server_url == "http://127.0.0.1:49374"
 
 
-def test_register_uses_env_var_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_initialize_uses_secret_env_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from __init__ import register
 
     hermes_home = tmp_path / ".hermes"
@@ -131,22 +158,31 @@ def test_register_uses_env_var_overrides(tmp_path: Path, monkeypatch: pytest.Mon
     register(ctx)
     args, _ = ctx.register_memory_provider.call_args
     provider = args[0]
-    assert provider._config.server_url == "http://env-override:49374"
+    provider.initialize(
+        "session", hermes_home=str(hermes_home), agent_context="subagent"
+    )
+    assert provider._config.server_url == "http://127.0.0.1:49374"
     assert provider._config.auth_token == "env-token"
 
 
-@pytest.mark.parametrize("source", ["file", "env"])
-def test_register_loads_search_scope(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+@pytest.mark.parametrize("source,expected", [("file", "global"), ("env", "project")])
+def test_initialize_loads_search_scope_from_profile_config_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    expected: str,
 ) -> None:
     from __init__ import register
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     if source == "file":
-        (tmp_path / "ai-memory.json").write_text(json.dumps({"search_scope": "project"}))
+        (tmp_path / "ai-memory.json").write_text(json.dumps({"search_scope": "global"}))
     else:
-        monkeypatch.setenv("AI_MEMORY_SEARCH_SCOPE", "project")
+        monkeypatch.setenv("AI_MEMORY_SEARCH_SCOPE", "global")
     ctx = MagicMock()
     register(ctx)
     provider = ctx.register_memory_provider.call_args.args[0]
-    assert provider._config.search_scope == "project"
+    provider.initialize(
+        "session", hermes_home=str(tmp_path), agent_context="subagent"
+    )
+    assert provider._config.search_scope == expected
